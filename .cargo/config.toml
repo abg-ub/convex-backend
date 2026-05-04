@@ -1,6 +1,10 @@
 [env]
 CARGO_WORKSPACE_ROOT = { value = "", relative = true }
 CHRONO_TZ_TIMEZONE_FILTER = "US/Pacific"
+# GCC 15+ is stricter about transitive includes; bundled RocksDB uses uint64_t without
+# including <cstdint>. `force = false` keeps a user-set CXXFLAGS from being overwritten.
+# https://github.com/rust-rocksdb/rust-rocksdb/issues/991
+CXXFLAGS = { value = "-include cstdint", force = false }
 
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-Ctarget-cpu=neoverse-n1", "-Cforce-frame-pointers=yes"]

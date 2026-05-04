@@ -64,10 +64,6 @@ const COMPONENTS: [&str; 5] = [
 const ADMIN_KEY: &str = include_str!("../keybroker/dev/admin_key.txt");
 
 #[cfg(not(target_os = "windows"))]
-const RUSH: &str = "../scripts/node_modules/.bin/rush";
-#[cfg(target_os = "windows")]
-const RUSH: &str = "../../scripts/node_modules/.bin/rush.cmd";
-#[cfg(not(target_os = "windows"))]
 const NPM: &str = "npm";
 #[cfg(target_os = "windows")]
 const NPM: &str = "npm.cmd";
@@ -91,6 +87,25 @@ fn rerun_if_changed(path: &str) -> anyhow::Result<()> {
     );
     println!("cargo:rerun-if-changed={path}");
     Ok(())
+}
+
+/// On Unix, Cargo build scripts run without the user's shell profile, so `nvm`
+/// is often not loaded. Delegate to `scripts/rush_from_npm-packages.sh`, which
+/// applies `.nvmrc` the same way as `just rush`.
+#[cfg(not(target_os = "windows"))]
+fn rush_command() -> Command {
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/rush_from_npm-packages.sh");
+    let mut cmd = Command::new("bash");
+    cmd.arg(script);
+    cmd
+}
+
+#[cfg(target_os = "windows")]
+fn rush_command() -> Command {
+    Command::new(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/node_modules/.bin/rush.cmd"),
+    )
 }
 
 fn write_bundles(out_dir: &Path, out_name: &str, bundles: Vec<Bundle>) -> anyhow::Result<()> {
@@ -200,8 +215,10 @@ fn main() -> anyhow::Result<()> {
 
     // Step 1: Ensure the `server`, `dashboard`, and `cli` deps are installed.
     for _ in 0..3 {
-        let output = Command::new(RUSH)
-            .current_dir(Path::new(PACKAGES_DIR))
+        let mut cmd = rush_command();
+        #[cfg(target_os = "windows")]
+        cmd.current_dir(Path::new(PACKAGES_DIR));
+        let output = cmd
             .args(["install"])
             .output()
             .context("Failed on rush install")?;
@@ -222,8 +239,10 @@ fn main() -> anyhow::Result<()> {
     if has_tests {
         pkgs.extend(["simulation", "udf-tests"]);
     }
-    let mut cmd = Command::new(RUSH);
-    cmd.current_dir(PACKAGES_DIR).arg("build");
+    let mut cmd = rush_command();
+    #[cfg(target_os = "windows")]
+    cmd.current_dir(PACKAGES_DIR);
+    cmd.arg("build");
     for pkg in pkgs {
         cmd.arg("-t");
         cmd.arg(pkg);
