@@ -10,6 +10,10 @@
 //!
 //! When running locally, these knobs can all be overridden with an environment
 //! variable.
+//!
+//! Set `CONVEX_RELAX_DEV_LIMITS=1` to raise common ceilings (concurrency,
+//! timeouts, write throughput, transaction sizes, isolate memory) for local app
+//! testing. Ignored when running in Nomad (production).
 #![deny(missing_docs)]
 
 use std::{
@@ -43,6 +47,48 @@ fn prod_override<T>(local_value: T, prod_value: T) -> T {
         return prod_value;
     }
     local_value
+}
+
+/// When `true`, raises many resource ceilings for local app and load testing.
+/// Set the environment variable `CONVEX_RELAX_DEV_LIMITS=1`. Has no effect in
+/// Nomad (production).
+static RELAX_DEV_LIMITS: LazyLock<bool> = LazyLock::new(|| {
+    if *IS_PROD {
+        return false;
+    }
+    std::env::var("CONVEX_RELAX_DEV_LIMITS")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+});
+
+const RELAXED_CONCURRENCY: usize = 1_000_000;
+const RELAXED_U64_THROUGHPUT: u64 = 1 << 40;
+const RELAXED_TX_BYTES: usize = 1 << 30; // 1 GiB per transaction
+const RELAXED_ISOLATE_HEAP: usize = 1 << 30; // 1 GiB
+const RELAXED_DURATION_DAY: Duration = Duration::from_secs(86_400);
+
+fn relax_dev_limit(v: usize, relaxed_floor: usize) -> usize {
+    if *RELAX_DEV_LIMITS {
+        v.max(relaxed_floor)
+    } else {
+        v
+    }
+}
+
+fn relax_dev_limit_u64(v: u64, relaxed_floor: u64) -> u64 {
+    if *RELAX_DEV_LIMITS {
+        v.max(relaxed_floor)
+    } else {
+        v
+    }
+}
+
+fn relax_dev_duration(v: Duration, relaxed_floor: Duration) -> Duration {
+    if *RELAX_DEV_LIMITS {
+        v.max(relaxed_floor)
+    } else {
+        v
+    }
 }
 
 /// Set a consistent thread stack size regardless of environment. This is
@@ -109,8 +155,10 @@ pub static HEAP_WORKER_REPORT_INTERVAL_SECONDS: LazyLock<Duration> =
 ///
 /// NOTE: If you update this, make sure to update the actions resource limits in
 /// the docs.
-pub static ACTION_USER_TIMEOUT: LazyLock<Duration> =
-    LazyLock::new(|| Duration::from_secs(env_config("ACTIONS_USER_TIMEOUT_SECS", 600)));
+pub static ACTION_USER_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    let v = Duration::from_secs(env_config("ACTIONS_USER_TIMEOUT_SECS", 600));
+    relax_dev_duration(v, RELAXED_DURATION_DAY)
+});
 
 /// Max number of rows we will read when calculating document deltas.
 pub static DOCUMENT_DELTAS_LIMIT: LazyLock<usize> =
@@ -187,8 +235,10 @@ pub static DEFAULT_DOCUMENTS_PAGE_SIZE: LazyLock<u32> =
 
 /// Maximum number of documents it's okay to load into memory at once.
 /// Note each document can be up to `::value::MAX_SIZE`.
-pub static DOCUMENTS_IN_MEMORY: LazyLock<usize> =
-    LazyLock::new(|| env_config("DOCUMENTS_IN_MEMORY", 512));
+pub static DOCUMENTS_IN_MEMORY: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("DOCUMENTS_IN_MEMORY", 512);
+    relax_dev_limit(v, RELAXED_CONCURRENCY)
+});
 
 /// Number of times to retry on retriable errors (out-of-retention, database
 /// timeout) in TableIterator
@@ -201,17 +251,22 @@ pub static HTTP_SERVER_TCP_BACKLOG: LazyLock<u32> =
 
 /// The max concurrent of concurrent HTTP requests. This also limits Node.js
 /// action callbacks concurrency since those go over http.
-pub static HTTP_SERVER_MAX_CONCURRENT_REQUESTS: LazyLock<usize> =
-    LazyLock::new(|| env_config("HTTP_SERVER_MAX_CONCURRENT_REQUESTS", 1024));
+pub static HTTP_SERVER_MAX_CONCURRENT_REQUESTS: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("HTTP_SERVER_MAX_CONCURRENT_REQUESTS", 1024);
+    relax_dev_limit(v, RELAXED_CONCURRENCY)
+});
 
 /// Max number of user writes in a transaction. Make sure to also increase
 /// `MAX_INSERT_SIZE` in mysql/src/lib.rs and postgres/src/lib.rs.
-pub static TRANSACTION_MAX_NUM_USER_WRITES: LazyLock<usize> =
-    LazyLock::new(|| env_config("TRANSACTION_MAX_NUM_USER_WRITES", 16000));
+pub static TRANSACTION_MAX_NUM_USER_WRITES: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("TRANSACTION_MAX_NUM_USER_WRITES", 16000);
+    relax_dev_limit(v, RELAXED_CONCURRENCY)
+});
 
 /// Max size of user writes in a transaction, in bytes
 pub static TRANSACTION_MAX_USER_WRITE_SIZE_BYTES: LazyLock<usize> = LazyLock::new(|| {
-    env_config("TRANSACTION_MAX_USER_WRITE_SIZE_BYTES", 1 << 24) // 16 MiB
+    let v = env_config("TRANSACTION_MAX_USER_WRITE_SIZE_BYTES", 1 << 24); // 16 MiB
+    relax_dev_limit(v, RELAXED_TX_BYTES)
 });
 
 /// SnapshotManager maintains a bounded time range of versions,
@@ -222,12 +277,14 @@ pub static MAX_TRANSACTION_WINDOW: LazyLock<Duration> =
 
 /// Maximum size in bytes of arguments to a function.
 pub static FUNCTION_MAX_ARGS_SIZE: LazyLock<usize> = LazyLock::new(|| {
-    env_config("FUNCTION_MAX_ARGS_SIZE", 1 << 24) // 16 MiB
+    let v = env_config("FUNCTION_MAX_ARGS_SIZE", 1 << 24); // 16 MiB
+    relax_dev_limit(v, RELAXED_TX_BYTES)
 });
 
 /// Maximum size in bytes of the result of a function.
 pub static FUNCTION_MAX_RESULT_SIZE: LazyLock<usize> = LazyLock::new(|| {
-    env_config("FUNCTION_MAX_RESULT_SIZE", 1 << 24) // 16 MiB
+    let v = env_config("FUNCTION_MAX_RESULT_SIZE", 1 << 24); // 16 MiB
+    relax_dev_limit(v, RELAXED_TX_BYTES)
 });
 
 /// When a function exceeds FUNCTION_LIMIT_WARNING_RATIO * a corresponding
@@ -241,19 +298,24 @@ pub static FUNCTION_LIMIT_WARNING_RATIO: LazyLock<f64> = LazyLock::new(|| {
 /// an additional 8000 system documents. If we hit this error, this is a system
 /// error, not a developer one. If you increase this value, make sure to also
 /// increase MAX_INSERT_SIZE in mysql/src/lib.rs and postgres/src/lib.rs.
-pub static TRANSACTION_MAX_SYSTEM_NUM_WRITES: LazyLock<usize> =
-    LazyLock::new(|| env_config("TRANSACTION_MAX_SYSTEM_NUM_WRITES", 40000));
+pub static TRANSACTION_MAX_SYSTEM_NUM_WRITES: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("TRANSACTION_MAX_SYSTEM_NUM_WRITES", 40000);
+    relax_dev_limit(v, RELAXED_CONCURRENCY)
+});
 
 /// We write user modules in system tables and those can get quite large.
 /// Similar to the above if we hit this limit, we should count this as system
 /// error and do a use case specific validation to avoid hitting this.
 pub static TRANSACTION_MAX_SYSTEM_WRITE_SIZE_BYTES: LazyLock<usize> = LazyLock::new(|| {
-    env_config("TRANSACTION_MAX_SYSTEM_WRITE_SIZE_BYTES", 1 << 27) // 128 MiB
+    let v = env_config("TRANSACTION_MAX_SYSTEM_WRITE_SIZE_BYTES", 1 << 27); // 128 MiB
+    relax_dev_limit(v, RELAXED_TX_BYTES)
 });
 
 /// Maximum number of scheduled transactions.
-pub static TRANSACTION_MAX_NUM_SCHEDULED: LazyLock<usize> =
-    LazyLock::new(|| env_config("TRANSACTION_MAX_NUM_SCHEDULED", 1000));
+pub static TRANSACTION_MAX_NUM_SCHEDULED: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("TRANSACTION_MAX_NUM_SCHEDULED", 1000);
+    relax_dev_limit(v, RELAXED_CONCURRENCY)
+});
 
 /// Maximum number of scheduled jobs to cancel in a single transaction.
 pub static MAX_JOBS_CANCEL_BATCH: LazyLock<usize> =
@@ -263,25 +325,26 @@ pub static MAX_JOBS_CANCEL_BATCH: LazyLock<usize> =
 /// This is not currently enforced.
 /// TODO: ideally this should be MAX_USER_SIZE.
 pub static MAX_SCHEDULED_JOB_ARGUMENT_SIZE_BYTES: LazyLock<usize> = LazyLock::new(|| {
-    env_config("MAX_SCHEDULED_JOB_ARGUMENT_SIZE_BYTES", 4 << 20) // 4 MiB
+    let v = env_config("MAX_SCHEDULED_JOB_ARGUMENT_SIZE_BYTES", 4 << 20); // 4 MiB
+    relax_dev_limit(v, RELAXED_TX_BYTES)
 });
 
 /// Maximum total size of the arguments to all functions scheduled in a single
 /// transaction.
 pub static TRANSACTION_MAX_SCHEDULED_TOTAL_ARGUMENT_SIZE_BYTES: LazyLock<usize> =
     LazyLock::new(|| {
-        env_config(
-            "TRANSACTION_MAX_SCHEDULED_TOTAL_ARGUMENT_SIZE_BYTES",
-            1 << 24,
-        ) // 16 MiB
+        let v = env_config("TRANSACTION_MAX_SCHEDULED_TOTAL_ARGUMENT_SIZE_BYTES", 1 << 24); // 16 MiB
+        relax_dev_limit(v, RELAXED_TX_BYTES)
     });
 
 /// Number of scheduled jobs that can execute in parallel.
 // Note that the current algorithm for executing ready jobs has up to
 // SCHEDULED_JOB_EXECUTION_PARALLELISM overhead for every executed job, so we
 // don't want to set this number too high.
-pub static SCHEDULED_JOB_EXECUTION_PARALLELISM: LazyLock<usize> =
-    LazyLock::new(|| env_config("SCHEDULED_JOB_EXECUTION_PARALLELISM", 8));
+pub static SCHEDULED_JOB_EXECUTION_PARALLELISM: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("SCHEDULED_JOB_EXECUTION_PARALLELISM", 8);
+    relax_dev_limit(v, RELAXED_CONCURRENCY)
+});
 
 /// Initial backoff in milliseconds on a system error from a scheduled job.
 pub static SCHEDULED_JOB_INITIAL_BACKOFF: LazyLock<Duration> =
@@ -335,14 +398,18 @@ pub static SCHEDULED_JOB_GARBAGE_COLLECTION_DELAY: LazyLock<Duration> =
 /// Maximum number of syscalls that can run in a batch together when
 /// awaited in parallel. Higher values improve latency, while lower ones
 /// protect one isolate from hogging database connections.
-pub static MAX_SYSCALL_BATCH_SIZE: LazyLock<usize> =
-    LazyLock::new(|| env_config("MAX_SYSCALL_BATCH_SIZE", 16));
+pub static MAX_SYSCALL_BATCH_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("MAX_SYSCALL_BATCH_SIZE", 16);
+    relax_dev_limit(v, 65_536)
+});
 
 /// Maximum depth of query/mutation -> query/mutation calls within the reactor.
 /// We put a low limit on this for now so users with infinite loops won't starve
 /// all of the threads on a single node.
-pub static MAX_REACTOR_CALL_DEPTH: LazyLock<usize> =
-    LazyLock::new(|| env_config("MAX_REACTOR_CALL_DEPTH", 8));
+pub static MAX_REACTOR_CALL_DEPTH: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("MAX_REACTOR_CALL_DEPTH", 8);
+    relax_dev_limit(v, 10_000)
+});
 
 /// Default number of records to fetch from an index if a prefetch hint is not
 /// provided.
@@ -350,17 +417,22 @@ pub static DEFAULT_QUERY_PREFETCH: LazyLock<usize> =
     LazyLock::new(|| env_config("DEFAULT_QUERY_PREFETCH", 100));
 
 /// Number of rows that can be read in a transaction.
-pub static TRANSACTION_MAX_READ_SIZE_ROWS: LazyLock<usize> =
-    LazyLock::new(|| env_config("TRANSACTION_MAX_READ_SIZE_ROWS", 32000));
+pub static TRANSACTION_MAX_READ_SIZE_ROWS: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("TRANSACTION_MAX_READ_SIZE_ROWS", 32000);
+    relax_dev_limit(v, RELAXED_CONCURRENCY)
+});
 
 /// Number of bytes that can be read in a transaction.
 pub static TRANSACTION_MAX_READ_SIZE_BYTES: LazyLock<usize> = LazyLock::new(|| {
-    env_config("TRANSACTION_MAX_READ_SIZE_BYTES", 1 << 24) // 16 MiB
+    let v = env_config("TRANSACTION_MAX_READ_SIZE_BYTES", 1 << 24); // 16 MiB
+    relax_dev_limit(v, RELAXED_TX_BYTES)
 });
 
 /// Maximum number of intervals that can be read in a transaction.
-pub static TRANSACTION_MAX_READ_SET_INTERVALS: LazyLock<usize> =
-    LazyLock::new(|| env_config("TRANSACTION_MAX_READ_SET_INTERVALS", 4096));
+pub static TRANSACTION_MAX_READ_SET_INTERVALS: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("TRANSACTION_MAX_READ_SET_INTERVALS", 4096);
+    relax_dev_limit(v, RELAXED_CONCURRENCY)
+});
 
 /// Intervals that can be read in a transaction before warning.
 pub static TRANSACTION_WARN_READ_SET_INTERVALS: LazyLock<usize> =
@@ -677,8 +749,10 @@ pub static VECTOR_INDEX_WORKER_PAGE_SIZE: LazyLock<usize> =
     LazyLock::new(|| env_config("VECTOR_INDEX_WORKER_PAGE_SIZE", 128));
 
 /// Timeout on "user time" spent during a UDF.
-pub static DATABASE_UDF_USER_TIMEOUT: LazyLock<Duration> =
-    LazyLock::new(|| Duration::from_secs(env_config("DATABASE_UDF_USER_TIMEOUT_SECONDS", 1)));
+pub static DATABASE_UDF_USER_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    let v = Duration::from_secs(env_config("DATABASE_UDF_USER_TIMEOUT_SECONDS", 1));
+    relax_dev_duration(v, RELAXED_DURATION_DAY)
+});
 
 /// Timeout on the "system time" during a UDF -- i.e. syscalls.
 // The user limits are not very tight, which requires us to have a high
@@ -688,20 +762,26 @@ pub static DATABASE_UDF_USER_TIMEOUT: LazyLock<Duration> =
 // aim to lower the SYSTEM_TIMEOUT limit over time by adding real parallelism
 // and adding limit on number of `awaits` which is lower than the number of
 // queries.
-pub static DATABASE_UDF_SYSTEM_TIMEOUT: LazyLock<Duration> =
-    LazyLock::new(|| Duration::from_secs(env_config("DATABASE_UDF_SYSTEM_TIMEOUT_SECONDS", 15)));
+pub static DATABASE_UDF_SYSTEM_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    let v = Duration::from_secs(env_config("DATABASE_UDF_SYSTEM_TIMEOUT_SECONDS", 15));
+    relax_dev_duration(v, RELAXED_DURATION_DAY)
+});
 
 /// Timeout on the time it takes to analyze code during a push.
-pub static ISOLATE_ANALYZE_USER_TIMEOUT: LazyLock<Duration> =
-    LazyLock::new(|| Duration::from_secs(env_config("ISOLATE_ANALYZE_USER_TIMEOUT_SECONDS", 4)));
+pub static ISOLATE_ANALYZE_USER_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    let v = Duration::from_secs(env_config("ISOLATE_ANALYZE_USER_TIMEOUT_SECONDS", 4));
+    relax_dev_duration(v, RELAXED_DURATION_DAY)
+});
 
 /// Increasing the size of the queue helps us deal with bursty requests. This is
 /// a CoDel queue [https://queue.acm.org/detail.cfm?id=2209336], which will
 /// switch from FIFO to LIFO queue when overloaded, in order to process as much
 /// as possible and avoid a congestion collapse. The primary downside of
 /// increase this is memory usage from the UDF arguments.
-pub static ISOLATE_QUEUE_SIZE: LazyLock<usize> =
-    LazyLock::new(|| env_config("ISOLATE_QUEUE_SIZE", 2000));
+pub static ISOLATE_QUEUE_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("ISOLATE_QUEUE_SIZE", 2000);
+    relax_dev_limit(v, RELAXED_CONCURRENCY)
+});
 
 /// The size of the pending commits in the committer queue. This is a FIFO
 /// queue, so if the queue is too large, we run into a risk of all requests
@@ -709,8 +789,10 @@ pub static ISOLATE_QUEUE_SIZE: LazyLock<usize> =
 /// each commit request is also typically larger than a isolate request. For
 /// time being, allow 128 slots, which is the maximum number of isolate threads
 /// in any process.
-pub static COMMITTER_QUEUE_SIZE: LazyLock<usize> =
-    LazyLock::new(|| env_config("COMMITTER_QUEUE_SIZE", 128));
+pub static COMMITTER_QUEUE_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("COMMITTER_QUEUE_SIZE", 128);
+    relax_dev_limit(v, 65_536)
+});
 
 /// 0 -> default (number of cores)
 pub static V8_THREADS: LazyLock<u32> = LazyLock::new(|| env_config("V8_THREADS", 0));
@@ -730,27 +812,36 @@ pub static ISOLATE_MAX_LIFETIME: LazyLock<Duration> =
 
 /// System timeout for V8 actions.
 /// This doesn't count most syscalls, but it does count module loading.
-pub static V8_ACTION_SYSTEM_TIMEOUT: LazyLock<Duration> =
-    LazyLock::new(|| Duration::from_secs(env_config("V8_ACTION_SYSTEM_TIMEOUT_SECONDS", 5 * 60)));
+pub static V8_ACTION_SYSTEM_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    let v = Duration::from_secs(env_config("V8_ACTION_SYSTEM_TIMEOUT_SECONDS", 5 * 60));
+    relax_dev_duration(v, RELAXED_DURATION_DAY)
+});
 
 /// The maximum amount of time
-pub static APPLICATION_FUNCTION_RUNNER_SEMAPHORE_TIMEOUT: LazyLock<Duration> =
-    LazyLock::new(|| {
-        Duration::from_millis(env_config(
-            "APPLICATION_FUNCTION_RUNNER_SEMAPHORE_TIMEOUT",
-            5000,
-        ))
-    });
+pub static APPLICATION_FUNCTION_RUNNER_SEMAPHORE_TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
+    let v = Duration::from_millis(env_config(
+        "APPLICATION_FUNCTION_RUNNER_SEMAPHORE_TIMEOUT",
+        5000,
+    ));
+    relax_dev_duration(
+        v,
+        Duration::from_millis(86_400_000), // 24h — avoid queue timeouts under load
+    )
+});
 
 /// The maximum write rate (per second) allowed for mutations and import
 /// Default 4 MiB
-pub static MAX_BYTES_WRITTEN_PER_SECOND: LazyLock<u64> =
-    LazyLock::new(|| env_config("MAX_BYTES_WRITTEN_PER_SECOND", 4 * 1024 * 1024));
+pub static MAX_BYTES_WRITTEN_PER_SECOND: LazyLock<u64> = LazyLock::new(|| {
+    let v = env_config("MAX_BYTES_WRITTEN_PER_SECOND", 4 * 1024 * 1024);
+    relax_dev_limit_u64(v, RELAXED_U64_THROUGHPUT)
+});
 
 /// Proposed new limit for write rate (per second)
 /// Default 1 MiB
-pub static PROPOSED_MAX_BYTES_WRITTEN_PER_SECOND: LazyLock<u64> =
-    LazyLock::new(|| env_config("PROPOSED_MAX_BYTES_WRITTEN_PER_SECOND", 1024 * 1024));
+pub static PROPOSED_MAX_BYTES_WRITTEN_PER_SECOND: LazyLock<u64> = LazyLock::new(|| {
+    let v = env_config("PROPOSED_MAX_BYTES_WRITTEN_PER_SECOND", 1024 * 1024);
+    relax_dev_limit_u64(v, RELAXED_U64_THROUGHPUT)
+});
 
 /// The time window (in milliseconds) used to track write throughput.
 pub static WRITE_THROUGHPUT_WINDOW: LazyLock<Duration> =
@@ -768,10 +859,11 @@ pub static DEFAULT_APPLICATION_MAX_FUNCTION_CONCURRENCY: usize = 16;
 ///
 /// The value here may be overridden by big brain.
 pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|| {
-    env_config(
+    let v = env_config(
         "APPLICATION_MAX_CONCURRENT_QUERIES",
         DEFAULT_APPLICATION_MAX_FUNCTION_CONCURRENCY,
-    )
+    );
+    relax_dev_limit(v, RELAXED_CONCURRENCY)
 });
 
 /// The maximum number of mutations that can be run concurrently by an
@@ -781,10 +873,11 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
 ///
 /// The value here may be overridden by big brain.
 pub static APPLICATION_MAX_CONCURRENT_MUTATIONS: LazyLock<usize> = LazyLock::new(|| {
-    env_config(
+    let v = env_config(
         "APPLICATION_MAX_CONCURRENT_MUTATIONS",
         DEFAULT_APPLICATION_MAX_FUNCTION_CONCURRENCY,
-    )
+    );
+    relax_dev_limit(v, RELAXED_CONCURRENCY)
 });
 
 /// The maximum number of v8 actions that can be run concurrently by an
@@ -798,8 +891,10 @@ pub static APPLICATION_MAX_CONCURRENT_MUTATIONS: LazyLock<usize> = LazyLock::new
 /// knob.
 ///
 /// The value here may be overridden by big brain.
-pub static APPLICATION_MAX_CONCURRENT_V8_ACTIONS: LazyLock<usize> =
-    LazyLock::new(|| env_config("APPLICATION_MAX_CONCURRENT_V8_ACTIONS", 64));
+pub static APPLICATION_MAX_CONCURRENT_V8_ACTIONS: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("APPLICATION_MAX_CONCURRENT_V8_ACTIONS", 64);
+    relax_dev_limit(v, RELAXED_CONCURRENCY)
+});
 
 /// The maximum number of node actions that can be run concurrently by an
 /// application
@@ -810,38 +905,52 @@ pub static APPLICATION_MAX_CONCURRENT_V8_ACTIONS: LazyLock<usize> =
 /// limit, we'll see 429 error responses for node actions.
 ///
 /// The value here may be overridden by big brain.
-pub static APPLICATION_MAX_CONCURRENT_NODE_ACTIONS: LazyLock<usize> =
-    LazyLock::new(|| env_config("APPLICATION_MAX_CONCURRENT_NODE_ACTIONS", 64));
+pub static APPLICATION_MAX_CONCURRENT_NODE_ACTIONS: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("APPLICATION_MAX_CONCURRENT_NODE_ACTIONS", 64);
+    relax_dev_limit(v, RELAXED_CONCURRENCY)
+});
 
 /// The maximum number of concurrent package uploads during
 /// `/api/deploy2/start_push` + `/api/deploy2/evaluate_push`.
-pub static APPLICATION_MAX_CONCURRENT_UPLOADS: LazyLock<usize> =
-    LazyLock::new(|| env_config("APPLICATION_MAX_CONCURRENT_UPLOADS", 4));
+pub static APPLICATION_MAX_CONCURRENT_UPLOADS: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("APPLICATION_MAX_CONCURRENT_UPLOADS", 4);
+    relax_dev_limit(v, 10_000)
+});
 
 /// The number of modules to analyze concurrently during a push.
 ///
 /// This only applies to isolate modules, not node ones.
-pub static ANALYZE_CONCURRENCY: LazyLock<usize> =
-    LazyLock::new(|| env_config("ANALYZE_CONCURRENCY", 4));
+pub static ANALYZE_CONCURRENCY: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("ANALYZE_CONCURRENCY", 4);
+    relax_dev_limit(v, 10_000)
+});
 
 /// Set a 64MB limit on the heap size.
-pub static ISOLATE_MAX_USER_HEAP_SIZE: LazyLock<usize> =
-    LazyLock::new(|| env_config("ISOLATE_MAX_USER_HEAP_SIZE", 1 << 26));
+pub static ISOLATE_MAX_USER_HEAP_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("ISOLATE_MAX_USER_HEAP_SIZE", 1 << 26);
+    relax_dev_limit(v, RELAXED_ISOLATE_HEAP)
+});
 
 /// Allow for some objects to persist between contexts, not necessarily created
 /// by the UDF.
-pub static ISOLATE_MAX_HEAP_EXTRA_SIZE: LazyLock<usize> =
-    LazyLock::new(|| env_config("ISOLATE_MAX_HEAP_EXTRA_SIZE", 1 << 25));
+pub static ISOLATE_MAX_HEAP_EXTRA_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("ISOLATE_MAX_HEAP_EXTRA_SIZE", 1 << 25);
+    relax_dev_limit(v, RELAXED_ISOLATE_HEAP)
+});
 
 /// Set the heap size limit for analyze requests. Analyze imports all user
 /// modules into a single isolate, which can require more memory than a single
 /// UDF execution. Defaults to the same as ISOLATE_MAX_USER_HEAP_SIZE.
-pub static ISOLATE_MAX_HEAP_FOR_ANALYZE: LazyLock<usize> =
-    LazyLock::new(|| env_config("ISOLATE_MAX_HEAP_FOR_ANALYZE", *ISOLATE_MAX_USER_HEAP_SIZE));
+pub static ISOLATE_MAX_HEAP_FOR_ANALYZE: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("ISOLATE_MAX_HEAP_FOR_ANALYZE", *ISOLATE_MAX_USER_HEAP_SIZE);
+    relax_dev_limit(v, RELAXED_ISOLATE_HEAP)
+});
 
 /// Set a separate 64MB limit on ArrayBuffer allocations.
-pub static ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE: LazyLock<usize> =
-    LazyLock::new(|| env_config("ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE", 1 << 26));
+pub static ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("ISOLATE_MAX_ARRAY_BUFFER_TOTAL_SIZE", 1 << 26);
+    relax_dev_limit(v, RELAXED_ISOLATE_HEAP)
+});
 
 /// Chunk sizes: 1, 2, 3, ..., MAX_DYNAMIC_SMART_CHUNK_SIZE incrementing by 1.
 /// These chunk sizes allow small (common) batches to be handled in a single
@@ -1285,8 +1394,10 @@ pub static MAX_BACKEND_RPC_HTTP_CHUNK_SIZE: LazyLock<usize> =
 
 /// The maximum size for requests to the backend public API. Must be at least 16
 /// MiB for function arguments.
-pub static MAX_BACKEND_PUBLIC_API_REQUEST_SIZE: LazyLock<usize> =
-    LazyLock::new(|| env_config("MAX_BACKEND_PUBLIC_API_REQUEST_SIZE", (1 << 24) + 2000)); // 16 MiB
+pub static MAX_BACKEND_PUBLIC_API_REQUEST_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("MAX_BACKEND_PUBLIC_API_REQUEST_SIZE", (1 << 24) + 2000); // 16 MiB
+    relax_dev_limit(v, RELAXED_TX_BYTES)
+});
 
 /// The maximum size for GRPC responses from searchlight.
 pub static MAX_SEARCHLIGHT_RESPONSE_SIZE: LazyLock<usize> =
@@ -1334,18 +1445,24 @@ pub static TABLE_SUMMARY_AGE_JITTER_SECONDS: LazyLock<f32> =
 /// HTTP requests to backend will time out after this duration has passed.
 ///
 /// See https://docs.rs/tower-http/0.5.0/tower_http/timeout/struct.TimeoutLayer.html
-pub static HTTP_SERVER_TIMEOUT_DURATION: LazyLock<Duration> =
-    LazyLock::new(|| Duration::from_secs(env_config("HTTP_SERVER_TIMEOUT_SECONDS", 300)));
+pub static HTTP_SERVER_TIMEOUT_DURATION: LazyLock<Duration> = LazyLock::new(|| {
+    let v = Duration::from_secs(env_config("HTTP_SERVER_TIMEOUT_SECONDS", 300));
+    relax_dev_duration(v, RELAXED_DURATION_DAY)
+});
 
 /// The limit on the request size to /push_config.
 // Schema and code bundle pushes must be less than this.
-pub static MAX_PUSH_BYTES: LazyLock<usize> =
-    LazyLock::new(|| env_config("MAX_PUSH_BYTES", 200_000_000));
+pub static MAX_PUSH_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("MAX_PUSH_BYTES", 200_000_000);
+    relax_dev_limit(v, 10_000_000_000) // 10 GB
+});
 
 /// The limit on the request size to /echo. Limits requests to 128MiB to help
 /// mitigate DDoS attacks.
-pub static MAX_ECHO_BYTES: LazyLock<usize> =
-    LazyLock::new(|| env_config("MAX_ECHO_BYTES", 128 * 1024 * 1024));
+pub static MAX_ECHO_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    let v = env_config("MAX_ECHO_BYTES", 128 * 1024 * 1024);
+    relax_dev_limit(v, 10_000_000_000) // 10 GB
+});
 
 /// The limit on the number of user modules in a push bundle.
 pub static MAX_USER_MODULES: LazyLock<usize> =

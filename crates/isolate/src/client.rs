@@ -191,7 +191,6 @@ impl IsolateConfig {
             limiter,
         }
     }
-
 }
 
 pub struct UdfRequest<RT: Runtime> {
